@@ -1,0 +1,845 @@
+diff -ruN aos_pintos/src/filesys/file.h pintos-solution/src/filesys/file.h
+--- aos_pintos/src/filesys/file.h	2024-03-23 07:06:53.879280671 +0000
++++ pintos-solution/src/filesys/file.h	2024-03-21 19:39:43.874822736 +0000
+@@ -3,6 +3,7 @@
+ 
+ #include "filesys/off_t.h"
+ #include "lib/stdbool.h"
++#include <list.h>
+ 
+ struct inode;
+ 
+@@ -14,6 +15,12 @@
+   bool deny_write;     /* Has file_deny_write() been called? */
+ };
+ 
++struct file_descriptor {
++  int fd;
++  struct file *file;
++  struct list_elem elem;
++};
++
+ /* Opening and closing files. */
+ struct file *file_open (struct inode *);
+ struct file *file_reopen (struct file *);
+diff -ruN aos_pintos/src/tests/userprog/sl-read.c pintos-solution/src/tests/userprog/sl-read.c
+--- aos_pintos/src/tests/userprog/sl-read.c	2024-03-23 07:07:09.497904012 +0000
++++ pintos-solution/src/tests/userprog/sl-read.c	2024-03-23 06:37:47.450539639 +0000
+@@ -27,12 +27,11 @@
+   CHECK ((link_fd = open ("test-link.txt")) > 1, "open \"test-link.txt\"");
+ 
+   char content[] = "This is a test";
+-  CHECK (write (target_fd, content, sizeof content - 1) == sizeof content - 1,
++  CHECK (write (target_fd, content, sizeof content) == sizeof content,
+          "write content to \"test.txt\"");
+   char buf[sizeof content];
+-  CHECK (read (link_fd, buf, sizeof content - 1) == sizeof content - 1,
++  CHECK (read (link_fd, buf, sizeof content) == sizeof content,
+          "read \"test-link.txt\"");
+ 
+-  buf[sizeof content] = '\0';
+   msg ("test-link.txt reads: '%s'", buf);
+-}
++}
+\ No newline at end of file
+diff -ruN aos_pintos/src/threads/thread.c pintos-solution/src/threads/thread.c
+--- aos_pintos/src/threads/thread.c	2024-03-23 07:06:58.550865683 +0000
++++ pintos-solution/src/threads/thread.c	2024-03-23 03:31:43.823417215 +0000
+@@ -4,10 +4,12 @@
+ #include <random.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <filesys/file.h>
+ #include "threads/flags.h"
+ #include "threads/interrupt.h"
+ #include "threads/intr-stubs.h"
+ #include "threads/palloc.h"
++#include "threads/malloc.h"
+ #include "threads/switch.h"
+ #include "threads/synch.h"
+ #include "threads/vaddr.h"
+@@ -37,6 +39,8 @@
+ /* Lock used by allocate_tid(). */
+ static struct lock tid_lock;
+ 
++static struct lock filesys_lock;
++
+ /* Stack frame for kernel_thread(). */
+ struct kernel_thread_frame
+ {
+@@ -89,6 +93,7 @@
+   ASSERT (intr_get_level () == INTR_OFF);
+ 
+   lock_init (&tid_lock);
++  lock_init (&filesys_lock);
+   list_init (&ready_list);
+   list_init (&all_list);
+ 
+@@ -178,6 +183,15 @@
+   init_thread (t, name, priority);
+   tid = t->tid = allocate_tid ();
+ 
++  /* Initialize thread child */
++  t->thread_child = malloc (sizeof (struct child));
++  t->thread_child->tid = tid;
++  sema_init (&t->thread_child->sema, 0);
++  list_push_back (&thread_current ()->childs, &t->thread_child->child_elem);
++
++  t->thread_child->exit_status = UINT32_MAX;
++  t->thread_child->has_run = false;
++
+   /* Stack frame for kernel_thread(). */
+   kf = alloc_frame (t, sizeof *kf);
+   kf->eip = NULL;
+@@ -269,10 +283,31 @@
+   process_exit ();
+ #endif
+ 
++  intr_disable ();
++
++  printf ("%s: exit(%d)\n", thread_name (), thread_current ()->st_exit);
++  thread_current ()->thread_child->exit_status = thread_current ()->st_exit;
++  sema_up (&thread_current ()->thread_child->sema);
++  file_close (thread_current ()->file_owned);
++
++  /*Close all files*/
++  struct list_elem *e;
++  struct list *files = &thread_current ()->files;
++  while (!list_empty (files))
++    {
++      e = list_pop_front (files);
++      struct thread_file *f = list_entry (e, struct thread_file, file_elem);
++      lock_acquire (&filesys_lock);
++      file_close (f->file);
++      lock_release (&filesys_lock);
++      list_remove (e);
++
++      free (f);
++    }
++
+   /* Remove thread from all threads list, set our status to dying,
+      and schedule another process.  That process will destroy us
+      when it calls thread_schedule_tail(). */
+-  intr_disable ();
+   list_remove (&thread_current ()->allelem);
+   thread_current ()->status = THREAD_DYING;
+   schedule ();
+@@ -428,6 +463,21 @@
+   t->stack = (uint8_t *) t + PGSIZE;
+   t->priority = priority;
+   t->magic = THREAD_MAGIC;
++  /* File system */
++  t->file_owned = NULL;
++  t->file_fd = 2;
++  if (t == initial_thread)
++    t->parent = NULL;
++  else
++    t->parent = thread_current ();
++
++  list_init (&t->childs);
++  list_init (&t->files);
++  list_init (&t->files);
++
++  sema_init (&t->sema, 0);
++  t->success = true;
++  t->st_exit = UINT32_MAX;
+ 
+   old_level = intr_disable ();
+   list_push_back (&all_list, &t->allelem);
+diff -ruN aos_pintos/src/threads/thread.h pintos-solution/src/threads/thread.h
+--- aos_pintos/src/threads/thread.h	2024-03-23 07:06:58.558864975 +0000
++++ pintos-solution/src/threads/thread.h	2024-03-23 03:22:01.700461224 +0000
+@@ -4,6 +4,7 @@
+ #include <debug.h>
+ #include <list.h>
+ #include <stdint.h>
++#include "threads/synch.h"
+ 
+ /* States in a thread's life cycle. */
+ enum thread_status
+@@ -24,6 +25,22 @@
+ #define PRI_DEFAULT 31 /* Default priority. */
+ #define PRI_MAX 63     /* Highest priority. */
+ 
++struct child
++{
++  tid_t tid;
++  int exit_status;
++  bool has_run;
++  struct list_elem child_elem;
++  struct semaphore sema;
++};
++
++struct thread_file
++{
++  int fd;
++  struct file *file;
++  struct list_elem file_elem;
++};
++
+ /* A kernel thread or user process.
+ 
+    Each thread structure is stored in its own 4 kB page.  The
+@@ -94,7 +111,6 @@
+ 
+   /* Shared between thread.c and synch.c. */
+   struct list_elem elem; /* List element. */
+-
+ #ifdef USERPROG
+   /* Owned by userprog/process.c. */
+   uint32_t *pagedir; /* Page directory. */
+@@ -102,6 +118,20 @@
+ 
+   /* Owned by thread.c. */
+   unsigned magic; /* Detects stack overflow. */
++
++
++  struct list childs;
++  struct child *thread_child;
++  int st_exit;
++  struct semaphore sema;
++  bool success;
++  struct thread *parent;
++
++  struct list files;
++  int file_fd;
++  struct file *file_owned;
++
++  uint32_t *esp;
+ };
+ 
+ /* If false (default), use round-robin scheduler.
+diff -ruN aos_pintos/src/userprog/exception.c pintos-solution/src/userprog/exception.c
+--- aos_pintos/src/userprog/exception.c	2024-03-23 07:06:58.670855059 +0000
++++ pintos-solution/src/userprog/exception.c	2024-03-23 03:49:18.272511920 +0000
+@@ -141,6 +141,13 @@
+   write = (f->error_code & PF_W) != 0;
+   user = (f->error_code & PF_U) != 0;
+ 
++  if (!user)
++    {
++      f->eip = f->eax;
++      f->eax = -1;
++      return;
++    }
++
+   /* To implement virtual memory, delete the rest of the function
+      body, and replace it with code that brings in the page to
+      which fault_addr refers. */
+diff -ruN aos_pintos/src/userprog/process.c pintos-solution/src/userprog/process.c
+--- aos_pintos/src/userprog/process.c	2024-03-23 07:06:58.682853996 +0000
++++ pintos-solution/src/userprog/process.c	2024-03-23 05:27:11.093212622 +0000
+@@ -5,6 +5,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <threads/malloc.h>
+ #include "userprog/gdt.h"
+ #include "userprog/pagedir.h"
+ #include "userprog/tss.h"
+@@ -18,8 +19,11 @@
+ #include "threads/thread.h"
+ #include "threads/vaddr.h"
+ 
++#define MAX_ARGS 128
++
+ static thread_func start_process NO_RETURN;
+ static bool load (const char *cmdline, void (**eip) (void), void **esp);
++void push_argument (void **esp, int argc, int argv[]);
+ 
+ /* Starts a new thread running a user program loaded from
+    FILENAME.  The new thread may be scheduled (and may even exit)
+@@ -37,13 +41,40 @@
+     return TID_ERROR;
+   strlcpy (fn_copy, file_name, PGSIZE);
+ 
++  char *save_ptr;
++  char *real_file_name = strtok_r (file_name, " ", &save_ptr);
++
+   /* Create a new thread to execute FILE_NAME. */
+-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
++  tid = thread_create (real_file_name, PRI_DEFAULT, start_process, fn_copy);
+   if (tid == TID_ERROR)
+     palloc_free_page (fn_copy);
++
++  sema_down (&thread_current ()->sema);
++  if (!thread_current ()->success)
++    return TID_ERROR;
++
+   return tid;
+ }
+ 
++/* Push arguments onto external stack pointer */
++void push_argument (void **esp, int argc, int argv[])
++{
++  *esp = (int) *esp & 0xfffffffc;
++  *((int *) esp) -= 4;
++  *(int *) *esp = 0;
++  for (int i = argc - 1; i >= 0; i--)
++    {
++      *((int *) esp) -= 4;
++      *(int *) *esp = argv[i];
++    }
++  *((int *) esp) -= 4;
++  *(int *) *esp = (int) *esp + 4;
++  *((int *) esp) -= 4;
++  *(int *) *esp = argc;
++  *((int *) esp) -= 4;
++  *(int *) *esp = 0;
++}
++
+ /* A thread function that loads a user process and starts it
+    running. */
+ static void start_process (void *file_name_)
+@@ -52,17 +83,45 @@
+   struct intr_frame if_;
+   bool success;
+ 
++  char *fn_copy = palloc_get_page (0);
++  if (fn_copy == NULL)
++    return TID_ERROR;
++  strlcpy (fn_copy, file_name, PGSIZE);
++
+   /* Initialize interrupt frame and load executable. */
+   memset (&if_, 0, sizeof if_);
+   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
+   if_.cs = SEL_UCSEG;
+   if_.eflags = FLAG_IF | FLAG_MBS;
++
++  char *token, *save_ptr;
++  file_name = strtok_r (file_name, " ", &save_ptr);
+   success = load (file_name, &if_.eip, &if_.esp);
+ 
++  if (success)
++    {
++      int argc = 0;
++      int argv[MAX_ARGS];
++      for (token = strtok_r (fn_copy, " ", &save_ptr); token != NULL;
++           token = strtok_r (NULL, " ", &save_ptr))
++        {
++          if_.esp = (int *) if_.esp - (strlen (token) + 1);
++          memcpy (if_.esp, token, strlen (token) + 1);
++          argv[argc++] = (int) if_.esp;
++        }
++      push_argument (&if_.esp, argc, argv);
++
++      thread_current ()->parent->success = true;
++      sema_up (&thread_current ()->parent->sema);
++    }
++
+   /* If load failed, quit. */
+-  palloc_free_page (file_name);
+-  if (!success)
+-    thread_exit ();
++  else
++    {
++      thread_current ()->parent->success = false;
++      sema_up (&thread_current ()->parent->sema);
++      thread_exit ();
++    }
+ 
+   /* Start the user process by simulating a return from an
+      interrupt, implemented by intr_exit (in
+@@ -70,7 +129,7 @@
+      arguments on the stack in the form of a `struct intr_frame',
+      we just point the stack pointer (%esp) to our stack frame
+      and jump to it. */
+-  asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
++  asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
+   NOT_REACHED ();
+ }
+ 
+@@ -83,7 +142,62 @@
+ 
+    This function will be implemented in problem 2-2.  For now, it
+    does nothing. */
+-int process_wait (tid_t child_tid UNUSED) { return -1; }
++int process_wait (tid_t child_tid)
++{
++  struct list *children = &thread_current ()->childs;
++  struct list_elem *e;
++
++  for (e = list_begin (children); e != list_end (children); e = list_next (e))
++    {
++      struct child *child = list_entry (e, struct child, child_elem);
++      if (child->tid == child_tid)
++        {
++          if (child->has_run)
++            {
++              /* Child has already been waited on. */
++              return -1;
++            }
++          /* Wait for the child process to finish. */
++          child->has_run = true;
++          sema_down (&child->sema);
++          /* Remove the child from the list after waiting. */
++          list_remove (e);
++          return child->exit_status;
++        }
++    }
++
++  /* If the child_tid is not found in the list of children, return error. */
++  return -1;
++}
++
++int process_set_file (struct file *file)
++{
++  struct file_descriptor *pfe;
++  pfe = (struct file_descriptor *) malloc (sizeof (struct file_descriptor));
++  if (pfe == NULL)
++    return -1;
++
++  struct thread *curr = thread_current ();
++  pfe->fd = curr->file_fd++;
++  pfe->file = file;
++  list_push_back (&curr->files, &pfe->elem);
++
++  return pfe->fd;
++}
++
++struct file *process_get_file (int fd)
++{
++  struct list *list = &thread_current ()->files;
++  struct list_elem *e;
++  for (e = list_begin (list); e != list_end (list); e = list_next (e))
++    {
++      struct file_descriptor *pfe =
++          list_entry (e, struct file_descriptor, elem);
++      if (pfe->fd == fd)
++        return pfe->file;
++    }
++  return NULL;
++}
+ 
+ /* Free the current process's resources. */
+ void process_exit (void)
+@@ -220,6 +334,8 @@
+       goto done;
+     }
+ 
++  file_deny_write (file);
++  t->file_owned = file;
+   /* Read and verify executable header. */
+   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr ||
+       memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7) || ehdr.e_type != 2 ||
+@@ -301,7 +417,6 @@
+ 
+ done:
+   /* We arrive here whether the load is successful or not. */
+-  file_close (file);
+   return success;
+ }
+ 
+@@ -448,4 +563,4 @@
+      address, then map our page there. */
+   return (pagedir_get_page (t->pagedir, upage) == NULL &&
+           pagedir_set_page (t->pagedir, upage, kpage, writable));
+-}
++}
+\ No newline at end of file
+diff -ruN aos_pintos/src/userprog/process.h pintos-solution/src/userprog/process.h
+--- aos_pintos/src/userprog/process.h	2024-03-23 07:06:58.746848330 +0000
++++ pintos-solution/src/userprog/process.h	2024-03-23 02:12:14.833108431 +0000
+@@ -7,5 +7,7 @@
+ int process_wait (tid_t);
+ void process_exit (void);
+ void process_activate (void);
++int process_set_file (struct file *file_name);
++struct file * process_get_file (int fd);
+ 
+ #endif /* userprog/process.h */
+diff -ruN aos_pintos/src/userprog/syscall.c pintos-solution/src/userprog/syscall.c
+--- aos_pintos/src/userprog/syscall.c	2024-03-23 07:06:58.774845851 +0000
++++ pintos-solution/src/userprog/syscall.c	2024-03-23 06:50:29.403466054 +0000
+@@ -1,19 +1,387 @@
+ #include "userprog/syscall.h"
++#include <debug.h>
+ #include <stdio.h>
+ #include <syscall-nr.h>
+-#include "devices/block.h"
++#include "devices/input.h"
++#include "filesys/file.h"
++#include "filesys/filesys.h"
++#include "threads/init.h"
+ #include "threads/interrupt.h"
++#include "threads/malloc.h"
++#include "threads/synch.h"
+ #include "threads/thread.h"
++#include "threads/vaddr.h"
++#include "userprog/process.h"
++#include "devices/shutdown.h"
++
++static struct lock filesys_lock;
++
++static int get_byte (const uint8_t *uaddr);
++static uint32_t get_word (const uint32_t *uaddr);
++static bool put_byte (uint8_t *udst, uint8_t byte);
++static void validate_read_location (const uint8_t *uaddr, size_t size);
++static void validate_write_location (uint8_t *udst, unsigned size);
+ 
+ static void syscall_handler (struct intr_frame *);
++struct thread_file *find_file_id (int fd);
++
++static void halt (void);
++static void exit (int status);
++static tid_t exec (const char *cmd_line);
++static int wait (tid_t tid);
++static bool create (const char *file, unsigned init_size);
++static bool remove (const char *file);
++static int open (const char *file);
++static int filesize (int fd);
++static int read (int fd, void *buffer, unsigned size);
++static int write (int fd, void *buffer, unsigned size);
++static void seek (int fd, unsigned position);
++static unsigned tell (int fd);
++static void close (int fd);
++int symlink (char *target, char *linkpath);
+ 
+ void syscall_init (void)
+ {
++  lock_init (&filesys_lock);
+   intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
+ }
+ 
+ static void syscall_handler (struct intr_frame *f UNUSED)
+ {
+-  printf ("system call!\n");
++  uint32_t *esp = f->esp;
++  thread_current ()->esp = esp;
++
++  switch (get_word (esp))
++    {
++      case SYS_HALT:
++        halt ();
++        break;
++      case SYS_EXIT:
++        exit ((int) get_word (esp + 1));
++        break;
++      case SYS_EXEC:
++        f->eax = exec ((const char *) get_word (esp + 1));
++        break;
++      case SYS_WAIT:
++        f->eax = wait ((tid_t) get_word (esp + 1));
++        break;
++      case SYS_CREATE:
++        f->eax = create ((const char *) get_word (esp + 1),
++                                 (unsigned) get_word (esp + 2));
++        break;
++      case SYS_REMOVE:
++        f->eax = remove ((const char *) get_word (esp + 1));
++        break;
++      case SYS_OPEN:
++        f->eax = open ((const char *) get_word (esp + 1));
++        break;
++      case SYS_FILESIZE:
++        f->eax = filesize ((int) get_word (esp + 1));
++        break;
++      case SYS_READ:
++        f->eax =
++            read ((int) get_word (esp + 1), (void *) get_word (esp + 2),
++                          (unsigned) get_word (esp + 3));
++        break;
++      case SYS_WRITE:
++        f->eax = write ((int) get_word (esp + 1),
++                                (void *) get_word (esp + 2),
++                                (unsigned) get_word (esp + 3));
++        break;
++      case SYS_SEEK:
++        seek ((int) get_word (esp + 1), (unsigned) get_word (esp + 2));
++        break;
++      case SYS_TELL:
++        f->eax = tell ((int) get_word (esp + 1));
++        break;
++      case SYS_CLOSE:
++        close ((int) get_word (esp + 1));
++        break;
++      case SYS_SYMLINK:
++        f->eax = symlink ((char *) get_word (esp + 1), (char *) get_word (esp + 2));
++        break;
++      default:
++        /* Nonexistant system call */
++        thread_exit ();
++    }
++}
++
++static void halt (void) { shutdown_power_off (); }
++
++static void exit (int status)
++{
++  thread_current ()->st_exit = status;
+   thread_exit ();
+-}
+\ No newline at end of file
++}
++
++static tid_t exec (const char *cmd_line)
++{
++  if (!cmd_line || !get_byte (cmd_line))
++    return -1;
++
++  tid_t tid = process_execute (cmd_line);
++
++  return tid;
++}
++
++static int wait (tid_t tid) { return process_wait (tid); }
++
++static bool create (const char *file, unsigned init_size)
++{
++  validate_read_location (file, 1);
++
++  lock_acquire (&filesys_lock);
++  bool success = filesys_create (file, init_size);
++  lock_release (&filesys_lock);
++  return success;
++}
++
++static bool remove (const char *file)
++{
++  validate_read_location (file, 1);
++
++  lock_acquire (&filesys_lock);
++  bool success = filesys_remove (file);
++  lock_release (&filesys_lock);
++  return success;
++}
++
++static int open (const char *file)
++{
++  validate_read_location (file, 1);
++
++  lock_acquire (&filesys_lock);
++  struct file *f = filesys_open (file);
++  if (f == NULL)
++    {
++      lock_release (&filesys_lock);
++      return -1;
++    }
++
++  int fd = process_set_file (f);
++
++  lock_release (&filesys_lock);
++  return fd;
++}
++
++static int filesize (int fd)
++{
++  lock_acquire (&filesys_lock);
++  struct file *file = process_get_file (fd);
++  if (file == NULL)
++    {
++      lock_release (&filesys_lock);
++      return -1;
++    }
++
++  int size = file_length (file);
++
++  lock_release (&filesys_lock);
++  return size;
++}
++
++static int read (int fd, void *buffer, unsigned size)
++{
++  uint8_t *bf = (uint8_t *) buffer;
++  validate_read_location (bf, size);
++  validate_write_location (bf, size);
++
++  /* Read STDIN (fd = 0) */
++  unsigned bytes = 0;
++  if (fd == 0)
++    {
++      uint8_t b;
++      while (bytes < size && (b = input_getc ()) != 0)
++        {
++          *bf++ = b;
++          bytes++;
++        }
++      return (int) bytes;
++    }
++
++  lock_acquire (&filesys_lock);
++  struct file *file = process_get_file (fd);
++  if (file == NULL)
++    {
++      lock_release (&filesys_lock);
++      return -1;
++    }
++
++  bytes = file_read (file, buffer, size);
++
++  lock_release (&filesys_lock);
++  return (int) bytes;
++}
++
++static int write (int fd, void *buffer, unsigned size)
++{
++  validate_read_location (buffer, size);
++
++  /* Write STDOUT (fd = 1) */
++  if (fd == 1)
++    {
++      putbuf (buffer, size);
++      return size;
++    }
++
++  lock_acquire (&filesys_lock);
++  struct file *file = process_get_file (fd);
++  if (file == NULL)
++    {
++      lock_release (&filesys_lock);
++      return -1;
++    }
++
++  int bytes = file_write (file, buffer, size);
++
++  lock_release (&filesys_lock);
++  return bytes;
++}
++
++static void seek (int fd, unsigned position)
++{
++  lock_acquire (&filesys_lock);
++  struct file *file = process_get_file (fd);
++  if (file == NULL)
++    {
++      lock_release (&filesys_lock);
++      return;
++    }
++
++  file_seek (file, position);
++
++  lock_release (&filesys_lock);
++}
++
++static unsigned tell (int fd)
++{
++  lock_acquire (&filesys_lock);
++  struct file *file = process_get_file (fd);
++  if (file == NULL)
++    {
++      lock_release (&filesys_lock);
++      return -1;
++    }
++
++  unsigned position = file_tell (file);
++
++  lock_release (&filesys_lock);
++  return position;
++}
++
++static void close (int fd)
++{
++  struct thread_file *opened_file = find_file_id (fd);
++  if (opened_file)
++    {
++      lock_acquire (&filesys_lock);
++      file_close (opened_file->file);
++      lock_release (&filesys_lock);
++      list_remove (&opened_file->file_elem);
++
++      free (opened_file);
++    }
++}
++
++int symlink (char *target, char *linkpath)
++{
++  lock_acquire (&filesys_lock);
++
++  // Check if the target exists
++  struct file *target_file = filesys_open (target);
++  if (target_file == NULL)
++    {
++      lock_release (&filesys_lock);
++      return -1; // Target does not exist
++    }
++  // Close the target file as we just needed to check its existence
++  file_close (target_file);
++
++  // Check if linkpath already exists
++  struct file *link_file = filesys_open (linkpath);
++  if (link_file != NULL)
++    {
++      // Linkpath exists, do not overwrite, close and exit
++      file_close (link_file);
++      lock_release (&filesys_lock);
++      return -1;
++    }
++
++  bool success = filesys_symlink (target, linkpath);
++  lock_release (&filesys_lock);
++
++  return success ? 0 : -1;
++}
++
++static int get_byte (const uint8_t *uaddr)
++{
++  if (!is_user_vaddr (uaddr))
++    return -1;
++  int result;
++  asm ("movl $1f, %0; movzbl %1, %0; 1:" : "=&a"(result) : "m"(*uaddr));
++  return result;
++}
++
++static uint32_t get_word (const uint32_t *uaddr)
++{
++  uint32_t word = 0;
++  for (int offset = 0; offset < sizeof (uint32_t); ++offset)
++    {
++      int byte_value = get_byte ((const uint8_t *) uaddr + offset);
++      if (byte_value == -1)
++        {
++          exit (-1);
++        }
++      *((uint8_t *) &word + offset) = (uint8_t) byte_value;
++    }
++  return word;
++}
++
++static bool put_byte (uint8_t *udst, uint8_t byte)
++{
++  if (!is_user_vaddr (udst))
++    return false;
++  int error_code;
++  asm ("movl $1f, %0; movb %b2, %1; 1:"
++       : "=&a"(error_code), "=m"(*udst)
++       : "r"(byte));
++  return error_code != -1;
++}
++
++static void validate_read_location (const uint8_t *uaddr, size_t size)
++{
++  uint8_t *ptr;
++  for (ptr = pg_round_down (uaddr); ptr < uaddr + size; ptr += PGSIZE)
++    {
++      if (get_byte (ptr) == -1)
++        {
++          exit (-1);
++        }
++    }
++}
++
++static void validate_write_location (uint8_t *udst, unsigned size)
++{
++  uint8_t *ptr;
++  for (ptr = pg_round_down (udst); ptr < udst + size; ptr += PGSIZE)
++    {
++      if (!put_byte (ptr, get_byte (ptr)))
++        {
++          exit (-1);
++        }
++    }
++}
++
++struct thread_file *find_file_id (int file_id)
++{
++  struct list_elem *e;
++  struct thread_file *thread_file_temp = NULL;
++  struct list *files = &thread_current ()->files;
++  for (e = list_begin (files); e != list_end (files); e = list_next (e))
++    {
++      thread_file_temp = list_entry (e, struct thread_file, file_elem);
++      if (file_id == thread_file_temp->fd)
++        return thread_file_temp;
++    }
++  return false;
++}
