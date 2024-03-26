@@ -72,7 +72,7 @@ struct thread_file
         0 kB +---------------------------------+
 
    The upshot of this is twofold:
-
+swap_sector
       1. First, `struct thread' must not be allowed to grow too
          big.  If it does, then there will not be enough room for
          the kernel stack.  Our base `struct thread' is only a
@@ -130,8 +130,24 @@ struct thread
   struct list files;
   int file_fd;
   struct file *file_owned;
+  int exit_code;                      /* Exit code. */
+  struct wait_status *wait_status;    /* This process's completion status. */
+  struct list children;               /* Completion status of children. */
+  // uint32_t *pagedir;                  /* Page directory. */
+  struct hash *vm;                    /* Page table. */
+  struct file *bin_file;              /* The binary executable. */
+  void *user_esp;
 
   uint32_t *esp;
+};
+
+struct wait_status {
+  struct list_elem elem;              /* `children' list element. */
+  struct lock lock;                   /* Protects ref_cnt. */
+  int ref_cnt;                        /* 2=child and parent both alive, 1=either child or parent alive, 0=child and parent both dead. */
+  tid_t tid;                          /* Child thread id. */
+  int exit_code;                      /* Child exit code, if dead. */
+  struct semaphore dead;              /* 1=child alive, 0=child dead. */
 };
 
 /* If false (default), use round-robin scheduler.

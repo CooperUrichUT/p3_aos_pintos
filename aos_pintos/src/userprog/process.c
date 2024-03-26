@@ -18,6 +18,9 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/synch.h"
+#include "vm/page.h"
+
 
 #define MAX_ARGS 128
 
@@ -199,28 +202,59 @@ struct file *process_get_file (int fd)
   return NULL;
 }
 
+static void release_child (struct wait_status *cs)
+{
+  int new_ref_cnt;
+
+  lock_acquire (&cs->lock);
+  new_ref_cnt = --cs->ref_cnt;
+  lock_release (&cs->lock);
+
+  if (new_ref_cnt == 0)
+    free (cs);
+}
+
 /* Free the current process's resources. */
 void process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+  struct list_elem *e, *next;
+
+  if (cur->wait_status != NULL) {
+    struct wait_status *cs = cur->wait_status;
+    cs->exit_code = cur->exit_code;
+    sema_up(&cs->dead);
+    release_child(cs);
+  }
+
+  for (e = list_begin(&cur->children); e != list_end(&cur->children); e = next) {
+    struct wait_status *cs = list_entry(e, struct wait_status, elem);
+    next = list_remove(e);
+    release_child(cs);
+  }
+
+  /* Destroy the page hash table. */
+  page_exit();
+
+  /* Close executable (and allow writes). */
+  file_close(cur->bin_file);
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
-  if (pd != NULL)
-    {
-      /* Correct ordering here is crucial.  We must set
-         cur->pagedir to NULL before switching page directories,
-         so that a timer interrupt can't switch back to the
-         process page directory.  We must activate the base page
-         directory before destroying the process's page
-         directory, or our active page directory will be one
-         that's been freed (and cleared). */
-      cur->pagedir = NULL;
-      pagedir_activate (NULL);
-      pagedir_destroy (pd);
-    }
+  if (pd != NULL) {
+    /* Correct ordering here is crucial.  We must set
+        cur->pagedir to NULL before switching page directories,
+        so that a timer interrupt can't switch back to the
+        process page directory.  We must activate the base page
+        directory before destroying the process's page
+        directory, or our active page directory will be one
+        that's been freed (and cleared). */
+    cur->pagedir = NULL;
+    pagedir_activate (NULL);
+    pagedir_destroy (pd);
+  }
 }
 
 /* Sets up the CPU for running user code in the current
@@ -490,38 +524,30 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
-  file_seek (file, ofs);
-  while (read_bytes > 0 || zero_bytes > 0)
-    {
+  while (read_bytes > 0 || zero_bytes > 0) {
       /* Calculate how to fill this page.
          We will read PAGE_READ_BYTES bytes from FILE
          and zero the final PAGE_ZERO_BYTES bytes. */
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
+      struct page *virtual_page = page_allocate(upage, !writable);
 
-      /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
-      if (kpage == NULL)
+      // Null check
+      if (virtual_page == NULL) {
         return false;
+      }
 
-      /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          palloc_free_page (kpage);
-          return false;
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
+      if (page_read_bytes > 0) {
+        virtual_page->file = file;
+        virtual_page->file_offset = ofs;
+        virtual_page->file_bytes = page_read_bytes;
+      }
 
-      /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable))
-        {
-          palloc_free_page (kpage);
-          return false;
-        }
 
       /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
+      ofs += page_read_bytes;
       upage += PGSIZE;
     }
   return true;
