@@ -5,12 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="7466b6ed-981d-4154-8f58-b1f5b217d338" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/aos_pintos/src/threads/thread.h" beforeDir="false" afterPath="$PROJECT_DIR$/aos_pintos/src/threads/thread.h" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/aos_pintos/src/userprog/process.c" beforeDir="false" afterPath="$PROJECT_DIR$/aos_pintos/src/userprog/process.c" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/aos_pintos/src/vm/frame.c" beforeDir="false" afterPath="$PROJECT_DIR$/aos_pintos/src/vm/frame.c" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/aos_pintos/src/vm/frame.h" beforeDir="false" afterPath="$PROJECT_DIR$/aos_pintos/src/vm/frame.h" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/aos_pintos/src/vm/page.c" beforeDir="false" afterPath="$PROJECT_DIR$/aos_pintos/src/vm/page.c" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/aos_pintos/src/vm/page.h" beforeDir="false" afterPath="$PROJECT_DIR$/aos_pintos/src/vm/page.h" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/aos_pintos/src/userprog/exception.c" beforeDir="false" afterPath="$PROJECT_DIR$/aos_pintos/src/userprog/exception.c" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -49,7 +45,7 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1711495323330</updated>
-      <workItem from="1711495325649" duration="377000" />
+      <workItem from="1711495325649" duration="1251000" />
     </task>
     <servers />
   </component>
